@@ -21,11 +21,11 @@ pip install -r requirements.txt
 ## Models
 
 - For LLMs, please refer to [tutorial](https://github.com/Lightning-AI/lit-gpt/tree/main/tutorials) for configuration steps, which support many mainstream LLMs like [LLaMA-2](https://github.com/Lightning-AI/lit-gpt/blob/main/tutorials/download_llama_2.md);
-- For well-trained adapter checkpoints, please refer to our [HuggingFace repo]().
+- For well-trained adapter checkpoints, please refer to our [HuggingFace repo](https://huggingface.co/PeacefulData/GenTranslate).
 
 ## Dataset
 
-We have released our HypoTranslate dataset at [HuggingFace]().
+We have released our HypoTranslate dataset at [HuggingFace](https://huggingface.co/datasets/PeacefulData/HypoTranslate).
 
 
 ## Inference Usage
