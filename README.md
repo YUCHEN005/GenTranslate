@@ -1,6 +1,6 @@
 # GenTranslate: Large Language Models are Generative Multilingual Speech and Machine Translators
 
-[[Paper]](https://openreview.net/pdf?id=ORXQBJKfFA) [[Data]](https://huggingface.co/datasets/PeacefulData/HypoTranslate) [[Model]](https://huggingface.co/PeacefulData/GenTranslate)
+[[Paper]](https://arxiv.org/abs/2402.06894) [[Data]](https://huggingface.co/datasets/PeacefulData/HypoTranslate) [[Model]](https://huggingface.co/PeacefulData/GenTranslate)
 
 This work proposes a generative paradigm for translation tasks that leverages LLMs to generate higher-quality translation results based on the N-best hypotheses decoded from foundation model (e.g., SeamlessM4T-Large-V2).
 We also release a HypoTranslate dataset to support LLM finetuning, which contains over 592K pairs of N-best hypotheses and ground-truth translation in 11 languages.
@@ -58,7 +58,7 @@ You will see the BLEU results of GenTranslate on your specified test set.
 @article{hu2024gentranslate,
   title={GenTranslate: Large Language Models are Generative Multilingual Speech and Machine Translators},
   author={Hu, Yuchen and Chen, Chen and Yang, Chao-Han Huck and Li, Ruizhe and Zhang, Dong and Chen, Zhehuai and Chng, Eng Siong},
-  journal={arXiv preprint arXiv:},
+  journal={arXiv preprint arXiv:2402.06894},
   year={2024}
 }
 ```
