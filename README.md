@@ -2,7 +2,7 @@
 
 [[Paper]](https://arxiv.org/abs/2402.06894) [[Data]](https://huggingface.co/datasets/PeacefulData/HypoTranslate) [[Model]](https://huggingface.co/PeacefulData/GenTranslate)
 
-<p align="center">  <img src="https://github.com/YUCHEN005/GenTranslate/blob/master/tutorials/genst-iclr24.png" height ="450"> </p>
+<p align="center">  <img src="https://github.com/YUCHEN005/GenTranslate/blob/master/tutorials/genst-iclr24.png" height ="300"> </p>
 
 This work proposes a generative paradigm for translation tasks that leverages LLMs to generate higher-quality translation results based on the N-best hypotheses decoded from foundation model (e.g., SeamlessM4T-Large-V2).
 We also release a HypoTranslate dataset to support LLM finetuning, which contains over 592K pairs of N-best hypotheses and ground-truth translation in 11 languages.
