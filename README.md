@@ -1,6 +1,6 @@
 # GenTranslate: Large Language Models are Generative Multilingual Speech and Machine Translators
 
-[[Paper]](https://arxiv.org/abs/2402.06894) [[Data]](https://huggingface.co/datasets/PeacefulData/HypoTranslate) [[Model]](https://huggingface.co/PeacefulData/GenTranslate) ![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white)
+[[Paper]](https://arxiv.org/abs/2402.06894) [[Data]](https://huggingface.co/datasets/PeacefulData/HypoTranslate) [[Model]](https://huggingface.co/PeacefulData/GenTranslate) [![Language](https://img.shields.io/badge/Language-multilingual-lightgrey#model-badge)](#datasets)
 
 <p align="center">  <img src="https://github.com/YUCHEN005/GenTranslate/blob/master/tutorials/genst-iclr24.png" height ="300"> </p>
 
