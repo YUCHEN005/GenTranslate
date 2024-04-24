@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## Models
 
-- For LLMs, please refer to [tutorial](https://github.com/Lightning-AI/lit-gpt/tree/main/tutorials) for configuration steps, which support many mainstream LLMs like [LLaMA-2](https://github.com/Lightning-AI/lit-gpt/blob/main/tutorials/download_llama_2.md);
+- For LLMs, please refer to [tutorial](https://github.com/Lightning-AI/lit-gpt/tree/main/tutorials) for configuration steps, which support many mainstream LLMs like [LLaMA-2](https://github.com/Lightning-AI/litgpt/blob/main/tutorials/download_model_weights.md);
 - For well-trained adapter checkpoints, please refer to our [HuggingFace repo](https://huggingface.co/PeacefulData/GenTranslate).
 
 ## Dataset
@@ -40,7 +40,7 @@ Before running inference, please follow the steps below for preparation:
    - Specify the source-target language pair, where we provide two example pairs `fr-en` and `en-fr`;
    - Specify the LLM size: `7b` for `fr-en`, `13b` for `en-fr`;
 2. Download and convert LLaMA-2 pre-trained checkpoint:
-   - Please refer to [official tutorial](https://github.com/Lightning-AI/lit-gpt/blob/main/tutorials/download_llama_2.md) to configure `Llama-2-7b-hf` and `Llama-2-13b-hf`;
+   - Please refer to [official tutorial](https://github.com/Lightning-AI/litgpt/blob/main/tutorials/download_model_weights.md) to configure `Llama-2-7b-hf` and `Llama-2-13b-hf`;
 3. Go to `inference/gentrans.py`:
    - Specify the experiment directory `exp_dir`: the root path of this README.md file;
    - Specify the data directory `data_dir`: the absolute path of test data (`.pt` file);
