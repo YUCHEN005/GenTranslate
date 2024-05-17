@@ -8,8 +8,6 @@ This work proposes a generative paradigm for translation tasks that leverages LL
 We also release a HypoTranslate dataset to support LLM finetuning, which contains over 592K pairs of N-best hypotheses and ground-truth translation in 11 languages.
 Experiments show that our GenTranslate significantly outperforms the state-of-the-art SeamlessM4T-Large-V2 on various speech and machine translation benchmarks.
 
-**TIP:** At this time (before publication), we provide inference script, test data and partial well-trained models only for inference use. Full-version resources of this paper, including training script, the entire HypoTranslate dataset and all the models, will be open sourced upon publication to benefit the community.
-
 ## Conda Environment Configuration
 
 Our code is built based on [lit-gpt](https://github.com/Lightning-AI/lit-gpt), please refer to [official tutorial](https://github.com/Lightning-AI/lit-gpt#setup) to build the conda environment. Then, please install the required packages using following command:
