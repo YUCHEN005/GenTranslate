@@ -2,13 +2,17 @@
 
 source activate <your-conda-env>
 
-### Configurations: 1. fleurs fr-en st 7b, 2. fleurs en-fr st 13b.
+### Note: "Llama-2-7b-hf" for x-en, and "Llama-2-13b-hf" for en-x;
 dataset=fleurs
 srclang=fr
 tgtlang=en
 task=st
-llmsize=7b
+seamless_size=large
+data_dir=<your-data-directory>
+llm_dir=<your-llama-directory>
+adapter_path=<your-adapter-ckpt>
 
-$cmd log/infer_gentrans_${dataset}_${srclang}_${tgtlang}_${task}.log \
-python inference/gentrans.py --dataset ${dataset} --srclang ${srclang} --tgtlang ${tgtlang} --task ${task} --llmsize ${llmsize}
-
+python inference/gentrans.py \
+        --dataset ${dataset} --srclang ${srclang} --tgtlang ${tgtlang} --task ${task} \
+        --seamless_size ${seamless_size} --data_dir ${data_dir} --llm_dir ${llm_dir} \
+        --adapter_path ${adapter_path}

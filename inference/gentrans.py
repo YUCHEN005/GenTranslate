@@ -26,7 +26,10 @@ parser.add_argument('--dataset', type=str)
 parser.add_argument('--srclang', type=str)
 parser.add_argument('--tgtlang', type=str)
 parser.add_argument('--task', type=str, default='st')
-parser.add_argument('--llmsize', type=str)
+parser.add_argument('--seamless_size', type=str)
+parser.add_argument('--data_dir', type=str)
+parser.add_argument('--llm_dir', type=str)
+parser.add_argument('--adapter_path', type=str)
 args = parser.parse_args()
 
 import sacrebleu
@@ -37,18 +40,15 @@ dataset = args.dataset
 srclang = args.srclang
 tgtlang = args.tgtlang
 task = args.task
-llmsize = args.llmsize
+seamless_size = args.seamless_size
+data_dir = args.data_dir
+llm_dir = args.llm_dir
+adapter_path = args.adapter_path
 
-### Customized paths
-exp_dir = ''        # experiment directory
-data_dir = ''       # test data directory
-llm_dir = ''        # llm checkpoint directory
-adapter_dir = ''    # adapter checkpoint directory
-
-exp_path = f'{exp_dir}/runs/gentrans_{dataset}_{srclang}_{tgtlang}_{task}'
+exp_path = f'runs/gentrans_{dataset}_{srclang}_{tgtlang}_{task}_{seamless_size}'
 sl = f'{exp_path}/predictions'  # place to save predictions
 
-data_path = f'{data_dir}/test_{dataset}_{srclang}_{tgtlang}_{task}.pt'
+data_path = f'{data_dir}/test_{dataset}_{srclang}_{tgtlang}_{task}_{seamless_size}.pt'
 
 precision = None
 quantize = None
@@ -59,7 +59,7 @@ precision = precision or get_default_supported_precision(training=False)
 fabric = L.Fabric(devices=devices, precision=precision, strategy=strategy)
 fabric.launch()
 
-checkpoint_dir = Path(f'{llm_dir}/Llama-2-{llmsize}-hf')
+checkpoint_dir = Path(llm_dir)
 check_valid_checkpoint_dir(checkpoint_dir)
 
 with open(checkpoint_dir / "lit_config.json") as fp:
@@ -83,7 +83,6 @@ def result(adapter_path, model):
     model.eval()
     model = fabric.setup(model)
 
-    return_dict = {}
     pr, gt = [], []
     to_json = []
     for datapoint in data:
@@ -107,32 +106,23 @@ def result(adapter_path, model):
 
         inf = output[len(tokenizer.decode(encoded)):].split('\n')[0].strip()
         ref = ground_truth.strip()
+        to_json.append({'inference': inf, 'ground_truth': ref})
 
         pr.append(inf)
         gt.append(ref)
-        to_json.append({'inference': inf, 'ground_truth': ref})
-
-    return_dict['adapter_path'] = adapter_path.split('/')[-1]
-
+        
     # BLEU score
     bleu_score = bleu_metric.corpus_score(pr, [gt]).score
-    print(f'BLEU is {bleu_score:.2f}')
-    return_dict['BLEU'] = bleu_score
-
-    print('*********************')
-
+    
     to_json.append({'BLEU': bleu_score})
 
     os.system(f'mkdir -p {sl}')
     with open(os.path.join(sl, adapter_path.split('/')[-1].split('.pth')[0] + '.json'), 'w') as f:
         f.write(json.dumps(to_json, indent=4, ensure_ascii=False))
-    print(os.path.join(sl, adapter_path.split('/')[-2] + '.json'))
 
-    return return_dict
+    return bleu_score
 
 
-adapter_path = f'{adapter_dir}/{dataset}_{srclang}_{tgtlang}_{task}.pth'
-
-result_dict = result(adapter_path, model)
-print(result_dict)
+bleu_score = result(adapter_path, model)
+print(f'{dataset}_{srclang}_{tgtlang}_{task}_{seamless_size}: BLEU = {bleu_score:.2f}')
 

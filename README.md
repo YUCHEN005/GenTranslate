@@ -17,37 +17,51 @@ Our code is built based on [lit-gpt](https://github.com/Lightning-AI/lit-gpt), p
 pip install -r requirements.txt
 ```
 
-## Code
+## Models and Checkpoints
 
-- Model code: `lit_gpt/gentrans.py`;
-- Inference script: `infer.sh`;
-
-## Models
-
-- For LLMs, please refer to [tutorial](https://github.com/Lightning-AI/lit-gpt/tree/main/tutorials) for configuration steps, which support many mainstream LLMs like [LLaMA-2](https://github.com/Lightning-AI/litgpt/blob/main/tutorials/download_model_weights.md);
+- For LLMs, please refer to [tutorial](https://github.com/YUCHEN005/GenTranslate/tree/master/tutorials) for download and conversion, which support many mainstream LLMs like [LLaMA-2](https://github.com/YUCHEN005/GenTranslate/tree/master/tutorials/download_model_weights.md) (we use `Llama-2-7b-hf` and `Llama-2-13b-hf` in this work);
 - For well-trained adapter checkpoints, please refer to our [HuggingFace repo](https://huggingface.co/PeacefulData/GenTranslate).
 
 ## Dataset
 
 We have released our HypoTranslate dataset at [HuggingFace](https://huggingface.co/datasets/PeacefulData/HypoTranslate).
 
+## Finetune
+We provide a finetuning script `finetune.sh`, please first enter it and specify some settings:
+- `<your-conda-env>`: your conda environment name;
+- `dataset`: training data source;
+- `srclang`: source language code;
+- `tgtlang`: target language code;
+- `task`: task name (options: `st`, `mt`);
+- `seamless_size`: SeamlessM4T size (options: `large`);
+- `data_dir`: data directory where the `.pt` files are put in;
+- `llm_dir`: llama checkpoint directory (options: `Llama-2-7b-hf`, `Llama-2-13b-hf`);
 
-## Inference Usage
-We provide two well-trained models and corresponding test sets for inference use, i.e., FLEURS Fr-En and En-Fr ST tasks.
-Before running inference, please follow the steps below for preparation:
-1. Go to `infer.sh`:
-   - Specify you conda environment `<your-conda-env>`;
-   - Specify the source-target language pair, where we provide two example pairs `fr-en` and `en-fr`;
-   - Specify the LLM size: `7b` for `fr-en`, `13b` for `en-fr`;
-2. Download and convert LLaMA-2 pre-trained checkpoint:
-   - Please refer to [official tutorial](https://github.com/Lightning-AI/litgpt/blob/main/tutorials/download_model_weights.md) to configure `Llama-2-7b-hf` and `Llama-2-13b-hf`;
-3. Go to `inference/gentrans.py`:
-   - Specify the experiment directory `exp_dir`: the root path of this README.md file;
-   - Specify the data directory `data_dir`: the absolute path of test data (`.pt` file);
-   - Specify the LLM directory `llm_dir`: the absolute path of your downloaded LLaMA-2 checkpoint;
-   - Specify the adapter directory `adapter_dir`: the absolute path of our released adapter checkpoint;
+**NOTE:** please use `Llama-2-7b-hf` for x-en, and `Llama-2-13b-hf` for en-x;
 
-Now you can run inference on your specified language direction by:
+Then, you can start finetuning by command:
+
+```bash
+bash finetune.sh
+```
+
+The trained adapter weights will be saved in `runs/gentrans_{dataset}_{srclang}_{tgtlang}_{task}_{seamless_size}/`.
+
+## Inference
+We provide an inference script `infer.sh`, please first enter it and specify some settings:
+- `<your-conda-env>`: your conda environment name;
+- `dataset`: training data source;
+- `srclang`: source language code;
+- `tgtlang`: target language code;
+- `task`: task name (options: `st`, `mt`);
+- `seamless_size`: SeamlessM4T size (options: `large`);
+- `data_dir`: data directory where the `.pt` files are put in;
+- `llm_dir`: llama checkpoint directory (options: `Llama-2-7b-hf`, `Llama-2-13b-hf`);
+- `adapter_path`: path of well-trained adapter checkpoint (`.pth` file);
+
+**NOTE:** please use `Llama-2-7b-hf` for x-en, and `Llama-2-13b-hf` for en-x;
+
+Now, you can run inference on your specified language pair by:
 ```bash
 bash infer.sh
 ```
@@ -56,11 +70,14 @@ You will see the BLEU results of GenTranslate on your specified test set.
 
 
 ## References
+If you consider this work would be related or useful for your research, please kindly consider to cite the work below. Thank you.
+
 ```bib
-@article{hu2024gentranslate,
-  title={GenTranslate: Large Language Models are Generative Multilingual Speech and Machine Translators},
-  author={Hu, Yuchen and Chen, Chen and Yang, Chao-Han Huck and Li, Ruizhe and Zhang, Dong and Chen, Zhehuai and Chng, Eng Siong},
-  journal={arXiv preprint arXiv:2402.06894},
-  year={2024}
+@inproceedings{hu2024gentranslate,
+    title = "GenTranslate: Large Language Models are Generative Multilingual Speech and Machine Translators",
+    author = "Hu, Yuchen and Chen, Chen and Yang, Chao-Han Huck and Li, Ruizhe and Zhang, Dong and Chen, Zhehuai and Chng, Eng Siong",
+    booktitle = "Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)",
+    publisher = "Association for Computational Linguistics",
+    year = "2024"
 }
 ```
