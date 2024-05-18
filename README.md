@@ -52,7 +52,7 @@ We provide an inference script `infer.sh`, please first enter it and specify som
 - `srclang`: source language code;
 - `tgtlang`: target language code;
 - `task`: task name (options: `st`, `mt`);
-- `seamless_size`: SeamlessM4T size (options: `large`);
+- `seamless_size`: SeamlessM4T size (options: `large`, `largev2`);
 - `data_dir`: data directory where the `.pt` files are put in;
 - `llm_dir`: llama checkpoint directory (options: `Llama-2-7b-hf`, `Llama-2-13b-hf`);
 - `adapter_path`: path of well-trained adapter checkpoint (`.pth` file);
