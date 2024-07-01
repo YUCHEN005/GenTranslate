@@ -147,7 +147,8 @@ def prepare(
     match: str = "",
 ) -> None:
     """Prepare the "Red Pajama" dataset. We assume tokenizer has been trained."""
-    config = Config.from_checkpoint(checkpoint_dir)
+    with open(checkpoint_dir / "lit_config.json") as fp:
+        config = Config(**json.load(fp))
 
     prepare_fn = prepare_sample if sample else prepare_full
     prepare_fn(

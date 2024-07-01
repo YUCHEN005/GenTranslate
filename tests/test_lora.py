@@ -1,20 +1,11 @@
-import sys
 from contextlib import redirect_stdout
 from io import StringIO
 from itertools import product
-from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 import torch
-from conftest import RunIf
 from lightning import Fabric
-
-# support running without installing as a package
-wd = Path(__file__).parent.parent.resolve()
-sys.path.append(str(wd))
-
-import lit_gpt.config as config_module
 
 
 def test_lora_layer_replacement():
@@ -131,7 +122,7 @@ def test_lora_filter(tmp_path):
     from lit_gpt.lora import GPT, lora_filter
 
     fabric = Fabric(devices=1)
-    model = GPT.from_name("pythia-14m", n_layer=3, r=1, to_query=True, to_value=True)
+    model = GPT.from_name("pythia-70m", n_layer=3, r=1, to_query=True, to_value=True)
     save_path = tmp_path / "model.pth"
     fabric.save(save_path, {"model": model}, filter={"model": lora_filter})
     saved = torch.load(save_path)["model"]
@@ -154,7 +145,6 @@ def test_lora_script(tmp_path, fake_checkpoint_dir, monkeypatch):
     module.save_interval = 2
     module.eval_interval = 2
     module.eval_iters = 2
-    module.eval_max_new_tokens = 1
     module.max_iters = 6
 
     data = [
@@ -168,7 +158,12 @@ def test_lora_script(tmp_path, fake_checkpoint_dir, monkeypatch):
 
     model_config = dict(block_size=128, n_layer=2, n_embd=8, n_head=4, padded_vocab_size=8)
     monkeypatch.setitem(name_to_config, "tmp", model_config)
-    monkeypatch.setattr(module, "load_checkpoint", Mock())
+
+    load_mock = Mock()
+    load_mock.return_value = load_mock
+    load_mock.__enter__ = Mock()
+    load_mock.__exit__ = Mock()
+    monkeypatch.setattr(module, "lazy_load", load_mock)
 
     tokenizer_mock = Mock()
     tokenizer_mock.return_value = tokenizer_mock
@@ -180,9 +175,9 @@ def test_lora_script(tmp_path, fake_checkpoint_dir, monkeypatch):
         module.setup(data_dir=tmp_path, checkpoint_dir=fake_checkpoint_dir, out_dir=tmp_path, precision="32-true")
 
     assert {p.name for p in tmp_path.glob("*.pth")} == {
-        "iter-000002-ckpt.pth",
-        "iter-000004-ckpt.pth",
-        "iter-000006-ckpt.pth",
+        "iter-000001-ckpt.pth",
+        "iter-000003-ckpt.pth",
+        "iter-000005-ckpt.pth",
         "lit_model_lora_finetuned.pth",
     }
     assert (tmp_path / "version_0" / "metrics.csv").is_file()
@@ -359,18 +354,18 @@ def test_lora_qkv_linear_weights_merged_status(rank, enable_lora, expected_merge
     assert layer.merged == expected_merged
 
 
-@RunIf(min_cuda_gpus=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="8bit requires CUDA")
 # platform dependent cuda issue: libbitsandbytes_cpu.so: undefined symbol: cquantize_blockwise_fp16_nf4
 @pytest.mark.xfail(raises=AttributeError, strict=False)
-# https://github.com/Lightning-AI/lit-gpt/issues/513
-@pytest.mark.xfail(raises=RuntimeError, strict=True)
 def test_lora_merge_with_quantize():
-    from lightning.fabric.plugins.precision.bitsandbytes import _BITSANDBYTES_AVAILABLE, BitsandbytesPrecision
+    from quantize.bnb import _BITSANDBYTES_AVAILABLE
 
     if not _BITSANDBYTES_AVAILABLE:
         pytest.skip("BNB not available")
 
     from lit_gpt.lora import GPT, Config, mark_only_lora_as_trainable, merge_lora_weights
+    from lit_gpt.utils import quantization
+    from quantize.bnb import bnb
 
     config = Config(
         n_layer=1,
@@ -385,44 +380,79 @@ def test_lora_merge_with_quantize():
         to_value=True,
         to_projection=True,
     )
-    fabric = Fabric(devices=1, plugins=BitsandbytesPrecision("nf4", dtype=torch.bfloat16, ignore_modules={"lm_head"}))
-    model = GPT(config)
-    mark_only_lora_as_trainable(model)
+    fabric = Fabric(devices=1, precision="bf16-mixed")
+    with fabric.init_module(empty_init=False), quantization("bnb.nf4"):
+        model = GPT(config)
+        model.apply(model._init_weights)
 
-    from bitsandbytes.optim import PagedAdamW
-
-    optimizer = PagedAdamW(model.parameters(), lr=1.0)
+    optimizer = bnb.optim.PagedAdamW(model.parameters(), lr=1.0)
     model, optimizer = fabric.setup(model, optimizer)
 
     model.train()
 
-    attn_proj = model.transformer.h[0].attn.proj
-    initial_weight = attn_proj.linear.weight.clone()
-
-    # this was skipped
-    assert model.lm_head.linear.weight.dtype is torch.float32
-    assert attn_proj.linear.weight.dtype is torch.uint8
+    initial_weight = model.transformer.h[0].attn.proj.weight.clone()
+    assert torch.equal(model.transformer.h[0].attn.proj.weight, initial_weight)
 
     # perform an update to the LoRA weights
+    mark_only_lora_as_trainable(model)
+
     y = model(torch.randint(0, 8, size=(2, 4), dtype=torch.int64, device=fabric.device))
-    loss = y.sum()
-    fabric.backward(loss)
+    y.sum().backward()
     optimizer.step()
     optimizer.zero_grad()
     # the weight remains unchanged (only lora A and B change)
-    assert torch.equal(attn_proj.linear.weight, initial_weight)
+    assert torch.equal(model.transformer.h[0].attn.proj.weight, initial_weight)
 
     # calling merge() multiple times in a row should not merge multiple times
     merge_lora_weights(model)
-    assert attn_proj.merged
-    weight_after = attn_proj.linear.weight.clone()
+    assert model.transformer.h[0].attn.attn.merged
+    weight_after = model.transformer.h[0].attn.proj.weight.clone()
     merge_lora_weights(model)
     merge_lora_weights(model)
-    assert torch.equal(attn_proj.linear.weight, weight_after)
+    assert torch.equal(model.transformer.h[0].attn.proj.weight, weight_after)
 
     # check that `W_after = W_initial + (A x B)`
-    delta_w = (attn_proj.lora_B @ attn_proj.lora_A) * attn_proj.scaling
+    a = model.transformer.h[0].attn.proj.lora_A
+    b = model.transformer.h[0].attn.proj.lora_B
+    scaling = model.transformer.h[0].attn.proj.scaling
+    delta_w = (b @ a) * scaling
     torch.testing.assert_close(weight_after, initial_weight + delta_w)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (
+        ("bnb.nf4", "Linear4bit"),
+        ("bnb.nf4-dq", "Linear4bit"),
+        ("bnb.fp4", "Linear4bit"),
+        ("bnb.fp4-dq", "Linear4bit"),
+        pytest.param(
+            "bnb.int8",
+            "Linear8bitLt",
+            marks=[
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="8bit requires CUDA"),
+                # platform dependent cuda issue: libbitsandbytes_cpu.so: undefined symbol: cget_col_row_stats
+                pytest.mark.xfail(raises=AttributeError, strict=False),
+            ],
+        ),
+    ),
+)
+def test_bnb_replacement(mode, expected):
+    from quantize.bnb import _BITSANDBYTES_AVAILABLE
+
+    if not _BITSANDBYTES_AVAILABLE:
+        pytest.skip("BNB not available")
+
+    from lit_gpt.lora import LoRALinear, LoRAQKVLinear
+    from lit_gpt.utils import quantization
+    from quantize.bnb import bnb
+
+    with quantization(mode):
+        linear = LoRALinear(1, 1)
+        qkv = LoRAQKVLinear(1, 1, 1, 1)
+    expected = getattr(bnb.modules, expected)
+    assert isinstance(linear.linear, expected)
+    assert isinstance(qkv.linear, expected)
 
 
 def test_lora_gpt_init_weights():
@@ -439,35 +469,18 @@ def test_lora_gpt_init_weights():
     assert (param == 0).all()
 
 
-@pytest.mark.parametrize("name", [c["name"] for c in config_module.configs])
-def test_base_model_can_be_lora_loaded(name):
+def test_base_model_can_be_lora_loaded():
     from lit_gpt.lora import GPT as LoRAGPT
     from lit_gpt.lora import lora_filter
     from lit_gpt.model import GPT as BaseGPT
 
-    kwargs = {"n_layer": 2, "n_head": 8, "n_embd": 16, "padded_vocab_size": 32}
-    base_model = BaseGPT.from_name(name, **kwargs)
+    base_model = BaseGPT.from_name("pythia-70m", bias=True, n_layer=2)
     base_model_state_dict = base_model.state_dict()
     lora_model = LoRAGPT.from_name(
-        name, **kwargs, r=1, to_query=True, to_key=True, to_value=True, to_projection=True, to_mlp=True, to_head=True
-    )
-    keys = lora_model.load_state_dict(base_model_state_dict, strict=False)
-    assert not keys.unexpected_keys
-    for k in keys.missing_keys:
-        assert lora_filter(k, None)
-
-
-@RunIf(dynamo=True)
-@torch.inference_mode()
-def test_lora_compile():
-    from lit_gpt.lora import GPT
-
-    model = GPT.from_name(
-        "pythia-14m",
-        n_layer=3,
-        r=8,
-        alpha=8,
-        dropout=0.1,
+        "pythia-70m",
+        bias=True,
+        n_layer=2,
+        r=1,
         to_query=True,
         to_key=True,
         to_value=True,
@@ -475,19 +488,7 @@ def test_lora_compile():
         to_mlp=True,
         to_head=True,
     )
-    x = torch.randint(model.config.vocab_size, size=(2, model.config.block_size), dtype=torch.int64)
-
-    from torch._dynamo.backends import debugging
-
-    explanation = torch._dynamo.explain(model)(x)
-    assert isinstance(explanation, debugging.ExplainOutput)
-    assert explanation.graph_count == 1
-    assert explanation.graph_break_count == 0
-
-    model = GPT(model.config)
-    model.set_kv_cache(2)
-    input_pos = torch.arange(model.config.block_size)
-    explanation = torch._dynamo.explain(model)(x, input_pos)
-    assert isinstance(explanation, debugging.ExplainOutput)
-    assert explanation.graph_count == 1
-    assert explanation.graph_break_count == 0
+    keys = lora_model.load_state_dict(base_model_state_dict, strict=False)
+    assert not keys.unexpected_keys
+    for k in keys.missing_keys:
+        assert lora_filter(k, None)

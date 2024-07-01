@@ -1,20 +1,19 @@
+import contextlib
 import gc
 import json
 import sys
-from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
-from lightning.fabric.utilities.load import _NotYetLoadedTensor as NotYetLoadedTensor
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from lit_gpt import Config
-from lit_gpt.utils import incremental_save, lazy_load
+from lit_gpt.utils import NotYetLoadedTensor, incremental_save, lazy_load
 
 
 def copy_weights_gpt_neox(
@@ -61,7 +60,7 @@ def copy_weights_gpt_neox(
 
 
 def copy_weights_falcon(
-    model_name: str,
+    size: Literal["7b", "40b"],
     state_dict: Dict[str, torch.Tensor],
     hf_weights: Dict[str, Union[torch.Tensor, NotYetLoadedTensor]],
     saver: Optional[incremental_save] = None,
@@ -78,14 +77,14 @@ def copy_weights_falcon(
         "lm_head.weight": "lm_head.weight",
     }
     # the original model definition is different for each size
-    if "7b" in model_name:
+    if size == "7b":
         weight_map.update(
             {
                 "transformer.h.{}.input_layernorm.bias": "transformer.h.{}.norm_1.bias",
                 "transformer.h.{}.input_layernorm.weight": "transformer.h.{}.norm_1.weight",
             }
         )
-    elif "40b" in model_name or "180B" in model_name:
+    elif size == "40b":
         weight_map.update(
             {
                 "transformer.h.{}.ln_attn.bias": "transformer.h.{}.norm_1.bias",
@@ -171,57 +170,6 @@ def copy_weights_hf_llama(
         del qkv_weights[i]
 
 
-def copy_weights_phi(
-    config: Config,
-    state_dict: Dict[str, torch.Tensor],
-    hf_weights: Dict[str, Union[torch.Tensor, NotYetLoadedTensor]],
-    saver: Optional[incremental_save] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> None:
-    if any(layer_name.startswith("layers.") for layer_name in hf_weights):
-        raise ValueError(
-            "You are using an outdated Phi1.5 checkpoint. "
-            "Please reload it as described in 'tutorials/download_phi15.md'"
-        )
-
-    weight_map = {
-        "transformer.embd.wte.weight": "transformer.wte.weight",
-        "transformer.h.{}.ln.bias": "transformer.h.{}.norm_1.bias",
-        "transformer.h.{}.ln.weight": "transformer.h.{}.norm_1.weight",
-        "transformer.h.{}.mixer.Wqkv.bias": "transformer.h.{}.attn.attn.bias",
-        "transformer.h.{}.mixer.Wqkv.weight": "transformer.h.{}.attn.attn.weight",
-        "transformer.h.{}.mixer.out_proj.bias": "transformer.h.{}.attn.proj.bias",
-        "transformer.h.{}.mixer.out_proj.weight": "transformer.h.{}.attn.proj.weight",
-        "transformer.h.{}.mixer.rotary_emb.inv_freq": None,
-        "transformer.h.{}.mlp.fc1.bias": "transformer.h.{}.mlp.fc.bias",
-        "transformer.h.{}.mlp.fc1.weight": "transformer.h.{}.mlp.fc.weight",
-        "transformer.h.{}.mlp.fc2.bias": "transformer.h.{}.mlp.proj.bias",
-        "transformer.h.{}.mlp.fc2.weight": "transformer.h.{}.mlp.proj.weight",
-        "lm_head.ln.weight": "transformer.ln_f.weight",
-        "lm_head.ln.bias": "transformer.ln_f.bias",
-        "lm_head.linear.weight": "lm_head.weight",
-        "lm_head.linear.bias": "lm_head.bias",
-    }
-
-    for name, param in hf_weights.items():
-        if name.startswith("transformer.h."):
-            from_name, number = layer_template(name, 2)
-            to_name = weight_map[from_name].format(number)
-        else:
-            to_name = weight_map[name]
-        param = load_param(param, name, dtype)
-        if "Wqkv" in name:
-            q_per_kv = config.n_head // config.n_query_groups
-            total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
-            param = param.view(total_qkv, config.n_query_groups, -1).transpose(0, 1)
-            param = param.reshape(config.n_embd * 3, -1)
-            if "bias" in name:
-                param = param.squeeze()
-        if saver is not None:
-            param = saver.store_early(param)
-        state_dict[to_name] = param
-
-
 def layer_template(layer_name: str, idx: int) -> Tuple[str, int]:
     split = layer_name.split(".")
     number = int(split[idx])
@@ -254,19 +202,16 @@ def convert_hf_checkpoint(
         dtype = getattr(torch, dtype)
 
     config = Config.from_name(model_name)
-    config_dict = asdict(config)
-    print(f"Model config {config_dict}")
+    print(f"Model config {config.__dict__}")
     with open(checkpoint_dir / "lit_config.json", "w") as json_config:
-        json.dump(config_dict, json_config)
+        json.dump(config.__dict__, json_config)
 
     if "falcon" in model_name:
-        copy_fn = partial(copy_weights_falcon, model_name)
+        copy_fn = partial(copy_weights_falcon, "40b" if config.n_embd == 8192 else "7b")
     elif config._mlp_class == "LLaMAMLP":
         # holder to reconstitute the split q, k, v
         qkv_weights = {}
         copy_fn = partial(copy_weights_hf_llama, config, qkv_weights)
-    elif "phi" in model_name:
-        copy_fn = partial(copy_weights_phi, config)
     else:
         copy_fn = copy_weights_gpt_neox
 
@@ -281,19 +226,18 @@ def convert_hf_checkpoint(
         bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
     else:
         bin_files = set(checkpoint_dir.glob("*.bin"))
-        # some checkpoints serialize the training arguments
-        bin_files = {f for f in bin_files if f.name != "training_args.bin"}
     if not bin_files:
         raise ValueError(f"Expected {str(checkpoint_dir)!r} to contain .bin files")
 
     with incremental_save(checkpoint_dir / "lit_model.pth") as saver:
         # for checkpoints that split the QKV across several files, we need to keep all the bin files
         # open, so we use `ExitStack` to close them all together at the end
-        for bin_file in sorted(bin_files):
-            print("Processing", bin_file)
-            hf_weights = lazy_load(bin_file)
-            copy_fn(sd, hf_weights, saver=saver, dtype=dtype)
-        gc.collect()
+        with contextlib.ExitStack() as stack:
+            for bin_file in sorted(bin_files):
+                print("Processing", bin_file)
+                hf_weights = stack.enter_context(lazy_load(bin_file))
+                copy_fn(sd, hf_weights, saver=saver, dtype=dtype)
+            gc.collect()
         print("Saving converted checkpoint")
         saver.save(sd)
 

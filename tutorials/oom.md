@@ -3,7 +3,7 @@
 If you got this error while running a script
 
 ```bash
-OutOfMemoryError: CUDA out of memory. Tried to allocate 2.22 GiB. GPU 0 has a total capacity of 79.15 GiB of which 228.38 MiB is free. Including non-PyTorch memory, this process
+OutOfMemoryError: CUDA out of memory. Tried to allocate 2.22 GiB. GPU 0 has a total capacty of 79.15 GiB of which 228.38 MiB is free. Including non-PyTorch memory, this process
 has 78.93 GiB memory in use. Of the allocated memory 76.28 GiB is allocated by PyTorch, and 2.14 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory
 is large try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
 ```
@@ -22,21 +22,13 @@ Experiment with different micro batch sizes to find a balance between memory con
 
 ### Reduce the model's context length
 
-The context length (`block_size` in the code) plays a significant role in running models with attention.
+The context length plays a significant role in running models with attention. By default, the scripts use the maximum
+context length of the model, or a shorter length if the data is smaller. However, your hardware may not support such large context lengths.
 
-* The pretraining scripts are configured to use the full context length of the model to train.
-* The finetuning scripts are configured to use the longest sample length of the training data to avoid allocating unnecessary memory (`max_seq_length` in the code).
-  If that's longer than the model's context length, an error is raised. If you try to run a batch that is longer than this, an error is raised.
+To manually reduce it, you can modify the `max_seq_length` argument passed to the model forward.
+Particularly, for the fine-tuning scripts, you can modify the `override_max_seq_length = None` at the beginning of the script.
 
-However, your hardware may not support such large context lengths. Here's what you can do:
-
-* For the pretraining scripts, you can simply reduce the `Config(block_size=...)` value.
-* For the finetuning scripts, you can trim the length of the samples in your dataset.
-  Most of the `scripts/prepare_*.py` scripts expose a `--max_seq_length=...` argument. This might also be useful in cases where
-  sample lengths are highly unbalanced, as the presence of a single very long sample would incur a larger memory usage for all other
-  shorter samples. For example, the median length of the samples in Alpaca is 110 tokens. Truncating the Alpaca dataset to 256 max tokens reduces the memory requirements of a Falcon 7B model from 23.52 GB to 15.73 GB. For more information about the dataset truncation, please see the *Truncating datasets* section in the [prepare_datasets.md](prepare_datasets.md) tutorial.
-
-Keep in mind that reducing the context length will affect the modelling performance on text sequences longer than the limit.
+Keep in mind that reducing the context length will affect the model's learning ability by limiting the attention window.
 
 ### Use lower precision
 

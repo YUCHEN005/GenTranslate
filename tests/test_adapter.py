@@ -4,7 +4,6 @@ from io import StringIO
 from unittest.mock import Mock
 
 import torch
-from conftest import RunIf
 from lightning import Fabric
 
 
@@ -12,7 +11,7 @@ def test_config_identical():
     import lit_gpt.adapter as gpt_adapter
     import lit_gpt.model as gpt
 
-    name = "pythia-14m"
+    name = "pythia-70m"
     base_config = asdict(gpt.Config.from_name(name))
     adapter_config = asdict(gpt_adapter.Config.from_name(name))
     del adapter_config["adapter_prompt_length"]
@@ -29,7 +28,7 @@ def test_adapter_filter(tmp_path):
     from lit_gpt.adapter import GPT, adapter_filter
 
     fabric = Fabric(devices=1)
-    model = GPT.from_name("pythia-14m", n_layer=4)
+    model = GPT.from_name("pythia-70m", n_layer=4)
     save_path = tmp_path / "model.pth"
     fabric.save(save_path, {"model": model}, filter={"model": adapter_filter})
     saved = torch.load(save_path)["model"]
@@ -50,7 +49,6 @@ def test_adapter_script(tmp_path, fake_checkpoint_dir, monkeypatch):
     module.save_interval = 2
     module.eval_interval = 2
     module.eval_iters = 2
-    module.eval_max_new_tokens = 1
     module.max_iters = 6
 
     data = [
@@ -65,8 +63,11 @@ def test_adapter_script(tmp_path, fake_checkpoint_dir, monkeypatch):
     model_config = dict(block_size=128, n_layer=2, n_embd=8, n_head=4, padded_vocab_size=8, adapter_start_layer=0)
     monkeypatch.setitem(name_to_config, "tmp", model_config)
 
-    monkeypatch.setattr(module, "lazy_load", Mock())
-    monkeypatch.setattr(module.GPT, "load_state_dict", Mock())
+    load_mock = Mock()
+    load_mock.return_value = load_mock
+    load_mock.__enter__ = Mock()
+    load_mock.__exit__ = Mock()
+    monkeypatch.setattr(module, "lazy_load", load_mock)
 
     tokenizer_mock = Mock()
     tokenizer_mock.return_value = tokenizer_mock
@@ -78,9 +79,9 @@ def test_adapter_script(tmp_path, fake_checkpoint_dir, monkeypatch):
         module.setup(data_dir=tmp_path, checkpoint_dir=fake_checkpoint_dir, out_dir=tmp_path, precision="32-true")
 
     assert {p.name for p in tmp_path.glob("*.pth")} == {
-        "iter-000002-ckpt.pth",
-        "iter-000004-ckpt.pth",
-        "iter-000006-ckpt.pth",
+        "iter-000001-ckpt.pth",
+        "iter-000003-ckpt.pth",
+        "iter-000005-ckpt.pth",
         "lit_model_adapter_finetuned.pth",
     }
     assert (tmp_path / "version_0" / "metrics.csv").is_file()
@@ -103,27 +104,3 @@ def test_adapter_gpt_init_weights():
     assert (param != 0).any()
     model.apply(model._init_weights)
     assert (param == 0).all()
-
-
-@RunIf(dynamo=True)
-@torch.inference_mode()
-def test_adapter_compile():
-    from lit_gpt.adapter import GPT
-
-    model = GPT.from_name("pythia-14m", n_layer=3)
-    x = torch.randint(model.config.vocab_size, size=(2, model.config.block_size), dtype=torch.int64)
-
-    from torch._dynamo.backends import debugging
-
-    explanation = torch._dynamo.explain(model)(x)
-    assert isinstance(explanation, debugging.ExplainOutput)
-    assert explanation.graph_count == 1
-    assert explanation.graph_break_count == 0
-
-    model = GPT(model.config)
-    model.set_kv_cache(2)
-    input_pos = torch.arange(model.config.block_size)
-    explanation = torch._dynamo.explain(model)(x, input_pos)
-    assert isinstance(explanation, debugging.ExplainOutput)
-    assert explanation.graph_count == 1
-    assert explanation.graph_break_count == 0

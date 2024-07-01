@@ -219,8 +219,6 @@ class CombinedDataset(IterableDataset):
         n_datasets = len(datasets)
         if weights is None:
             self._weights = [1 / n_datasets] * n_datasets
-        else:
-            self._weights = [w / sum(weights) for w in weights]
 
     def __iter__(self):
         return CombinedDatasetIterator(self._datasets, self._seed, self._weights)

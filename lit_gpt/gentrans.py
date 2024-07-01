@@ -16,12 +16,14 @@ from lit_gpt.config import Config as BaseConfig
 from lit_gpt.model import GPT as BaseModel
 from lit_gpt.model import CausalSelfAttention as BaseCausalSelfAttention
 from lit_gpt.model import KVCache, RoPECache, apply_rope
+from lit_gpt.rmsnorm import RMSNorm
 
 
 @dataclass
 class Config(BaseConfig):
     adapter_prompt_length: int = 10
     adapter_start_layer: int = 2
+    encoder_feats_dim: int = 1024
 
 
 class CausalSelfAttention(BaseCausalSelfAttention):
@@ -35,20 +37,31 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             self.adapter_wte = nn.Embedding(config.adapter_prompt_length, config.n_embd)
             # gate for adaption
             self.gating_factor = torch.nn.Parameter(torch.zeros(1, 1, config.n_head, 1))
+
+            # projector for encoder feats
+            self.proj_feats_key = nn.Linear(config.encoder_feats_dim, config.n_embd, bias=False)
+            self.proj_feats_value = nn.Linear(config.encoder_feats_dim, config.n_embd, bias=False)
+            self.rms_feats_key = RMSNorm(config.n_embd)
+            self.rms_feats_value = RMSNorm(config.n_embd)
+            self.feats_gating_factor = torch.nn.Parameter(torch.zeros(1, 1, config.n_head, 1))
+
             self.reset_parameters()
         self.block_idx = block_idx
 
     def forward(
         self,
         x: torch.Tensor,
+        encoder_feats: torch.Tensor,
         rope: RoPECache,
         max_seq_length: int,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         adapter_kv_cache: Optional[KVCache] = None,
+        feats_kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache], Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        _, fT, _ = encoder_feats.shape
 
         qkv = self.attn(x)
 
@@ -95,6 +108,7 @@ class CausalSelfAttention(BaseCausalSelfAttention):
         y = self.scaled_dot_product_attention(q, k, v, mask=mask)
 
         if self.block_idx >= self.config.adapter_start_layer:
+            ### 1. adaptation prompt
             aT = self.config.adapter_prompt_length
             if adapter_kv_cache is not None:
                 ak, av = adapter_kv_cache
@@ -116,12 +130,26 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             ay = self.scaled_dot_product_attention(q, ak, av, amask)
             y = y + self.gating_factor * ay
 
+            ### 2. source language feats from encoder
+            if feats_kv_cache is not None:
+                fk, fv = feats_kv_cache
+            else:
+                fk, fv = self.proj_feats_key(encoder_feats), self.proj_feats_value(encoder_feats)
+                # (B, 32, fT, 128)
+                fk = self.rms_feats_key(fk).view(B, fT, -1, self.config.head_size).transpose(1, 2).contiguous()
+                fv = self.rms_feats_value(fv).view(B, fT, -1, self.config.head_size).transpose(1, 2).contiguous()
+                feats_kv_cache = fk, fv
+                
+            fmask = torch.ones(T, fT, dtype=torch.bool, device=x.device)
+            fy = self.scaled_dot_product_attention(q, fk, fv, fmask)
+            y = y + self.feats_gating_factor * fy
+        
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.proj(y)
 
-        return y, kv_cache, adapter_kv_cache
+        return y, kv_cache, adapter_kv_cache, feats_kv_cache
 
     def reset_parameters(self) -> None:
         torch.nn.init.zeros_(self.gating_factor)
@@ -150,16 +178,18 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        encoder_feats: torch.Tensor,
         rope: RoPECache,
         max_seq_length: int,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         adapter_kv_cache: Optional[KVCache] = None,
+        feats_kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache], Optional[KVCache]]:
         n_1 = self.norm_1(x)
-        h, new_kv_cache, new_adapter_kv_cache = self.attn(
-            n_1, rope, max_seq_length, mask, input_pos, kv_cache, adapter_kv_cache
+        h, new_kv_cache, new_adapter_kv_cache, new_feats_kv_cache = self.attn(
+            n_1, encoder_feats, rope, max_seq_length, mask, input_pos, kv_cache, adapter_kv_cache, feats_kv_cache
         )
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
@@ -172,7 +202,7 @@ class Block(nn.Module):
                 )
             x = x + h
             x = x + self.mlp(self.norm_2(x))
-        return x, new_kv_cache, new_adapter_kv_cache
+        return x, new_kv_cache, new_adapter_kv_cache, new_feats_kv_cache
 
 
 class GPT(BaseModel):
@@ -197,14 +227,17 @@ class GPT(BaseModel):
         self.mask_cache: Optional[torch.Tensor] = None
         self.kv_caches: List[KVCache] = []
         self.adapter_kv_caches: List[KVCache] = []
+        self.feats_kv_caches: List[KVCache] = []
 
     def reset_cache(self) -> None:
         super().reset_cache()
         self.adapter_kv_caches.clear()
+        self.feats_kv_caches.clear()
 
     def forward(
         self,
         idx: torch.Tensor,
+        encoder_feats: torch.Tensor,
         max_seq_length: Optional[int] = None,
         input_pos: Optional[torch.Tensor] = None,
         lm_head_chunk_size: int = 0,
@@ -217,7 +250,7 @@ class GPT(BaseModel):
             max_seq_length = block_size
         if use_kv_cache:  # not relevant otherwise
             assert (
-                max_seq_length >= T
+                    max_seq_length >= T
             ), f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
         assert block_size >= T, f"Cannot forward sequence of length {T}, block size is only {block_size}"
@@ -246,13 +279,15 @@ class GPT(BaseModel):
 
         if not use_kv_cache:
             for block in self.transformer.h:
-                x, *_ = block(x, (cos, sin), max_seq_length)
+                x, *_ = block(x, encoder_feats, (cos, sin), max_seq_length)
         else:
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1))
             self.adapter_kv_caches = self.adapter_kv_caches or [None for _ in range(self.config.n_layer)]
+            self.feats_kv_caches = self.feats_kv_caches or [None for _ in range(self.config.n_layer)]
             for i, block in enumerate(self.transformer.h):
-                x, self.kv_caches[i], self.adapter_kv_caches[i] = block(
-                    x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i], self.adapter_kv_caches[i]
+                x, self.kv_caches[i], self.adapter_kv_caches[i], self.feats_kv_caches[i] = block(
+                    x, encoder_feats, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i],
+                    self.adapter_kv_caches[i], self.feats_kv_caches[i]
                 )
 
         x = self.transformer.ln_f(x)
@@ -278,6 +313,6 @@ def mark_only_adapter_as_trainable(model: GPT) -> None:
     for name, param in model.named_parameters():
         param.requires_grad = adapter_filter(name, param)
 
-def adapter_filter(key: str, value: Any) -> bool:
-    return "adapter_wte" in key or "gating_factor" in key or 'padding' in key or 'projection' in key
 
+def adapter_filter(key: str, value: Any) -> bool:
+    return "adapter_wte" in key or "gating_factor" in key or 'feats' in key

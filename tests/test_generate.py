@@ -11,9 +11,7 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize(
-    "max_seq_length", (pytest.param(10, marks=pytest.mark.xfail(raises=NotImplementedError, strict=True)), 20 + 5)
-)
+@pytest.mark.parametrize("max_seq_length", (10, 20 + 5))
 def test_generate(max_seq_length):
     import generate.base as generate
     from lit_gpt import GPT, Config
@@ -23,19 +21,18 @@ def test_generate(max_seq_length):
 
     config = Config(block_size=128, vocab_size=16, n_layer=1, n_head=4, n_embd=8)
     model = GPT(config)
-    model.max_seq_length = max_seq_length
-    model.set_kv_cache(batch_size=1)
     max_new_tokens = 20
 
     multinomial_results = []
+    original_multinomial = torch.multinomial
 
     def multinomial(*args, **kwargs):
-        out = torch.multinomial(*args, **kwargs, num_samples=1)
+        out = original_multinomial(*args, **kwargs)
         multinomial_results.append(out)
         return out
 
-    with mock.patch("generate.base.multinomial_num_samples_1", multinomial):
-        out = generate.generate(model, input_idx, T + max_new_tokens, top_k=4)
+    with mock.patch("torch.multinomial", multinomial):
+        out = generate.generate(model, input_idx, T + max_new_tokens, max_seq_length=max_seq_length, top_k=4)
 
     assert out.size(0) == T + max_new_tokens
     multinomial_results = torch.hstack(multinomial_results)
@@ -44,7 +41,7 @@ def test_generate(max_seq_length):
     torch.testing.assert_close(out, expected)
 
 
-def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
+def test_main(fake_checkpoint_dir, monkeypatch):
     import generate.base as generate
 
     config_path = fake_checkpoint_dir / "lit_config.json"
@@ -55,7 +52,9 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
     module_mock.config.block_size = 128
     load_mock = Mock()
     load_mock.return_value = load_mock
-    monkeypatch.setattr(generate, "load_checkpoint", load_mock)
+    load_mock.__enter__ = Mock()
+    load_mock.__exit__ = Mock()
+    monkeypatch.setattr(generate, "lazy_load", load_mock)
     tokenizer_mock = Mock()
     tokenizer_mock.return_value.encode.return_value = torch.tensor([1, 2, 3])
     tokenizer_mock.return_value.decode.return_value = "foo bar baz"
@@ -71,7 +70,7 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
 
     assert len(tokenizer_mock.return_value.decode.mock_calls) == num_samples
     assert torch.allclose(tokenizer_mock.return_value.decode.call_args[0][0], generate_mock.return_value)
-    assert generate_mock.mock_calls == [call(ANY, tensor_like, 53, temperature=2.0, top_k=2)] * num_samples
+    assert generate_mock.mock_calls == [call(ANY, ANY, 53, max_seq_length=53, temperature=2.0, top_k=2)] * num_samples
     # only the generated result is printed to stdout
     assert out.getvalue() == "foo bar baz\n" * num_samples
 
@@ -83,21 +82,3 @@ def test_cli():
     output = subprocess.check_output([sys.executable, cli_path, "-h"])
     output = str(output.decode())
     assert "Generates text samples" in output
-
-
-@pytest.mark.parametrize("temperature", (0.0, 1.0, 0.5))
-def test_sample(temperature):
-    from generate.base import sample
-
-    # shape: 2x3x5
-    logits = torch.tensor(
-        [
-            [[24, 4, 98, 77, 47], [65, 70, 32, 67, 24], [92, 32, 88, 36, 62]],
-            [[85, 79, 57, 68, 50], [89, 46, 72, 45, 32], [68, 96, 68, 24, 36]],
-        ]
-    )
-    token = sample(logits, temperature=temperature)
-
-    assert token.shape == (1,)
-    # sample is batch size 1 only for now - this should be [0, 1] once batched generation is supported
-    assert token.tolist() == [0]

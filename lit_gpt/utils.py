@@ -1,22 +1,20 @@
 """Utility functions for training and inference."""
-import math
+
 import pickle
 import sys
-from contextlib import nullcontext
+import warnings
+from contextlib import contextmanager
+from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, ContextManager, Dict, List, Mapping, Optional, TypeVar, Union
+from types import MethodType
+from typing import Any, Dict, List, Mapping, Optional, Type, TypeVar, Union
 
-import lightning as L
 import torch
 import torch.nn as nn
 import torch.utils._device
-from lightning.fabric.strategies import FSDPStrategy
-from lightning.fabric.utilities.load import _lazy_load as lazy_load
+from lightning.fabric.loggers import CSVLogger
 from torch.serialization import normalize_storage_type
-
-if TYPE_CHECKING:
-    from lit_gpt import GPT
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -27,30 +25,209 @@ def find_multiple(n: int, k: int) -> int:
 
 
 def num_parameters(module: nn.Module, requires_grad: Optional[bool] = None) -> int:
-    total = 0
-    for p in module.parameters():
-        if requires_grad is None or p.requires_grad == requires_grad:
-            if hasattr(p, "quant_state"):
-                # bitsandbytes 4bit layer support
-                total += math.prod(p.quant_state[1])
-            else:
-                total += p.numel()
-    return total
+    return sum(p.numel() for p in module.parameters() if requires_grad is None or p.requires_grad == requires_grad)
 
 
-def gptq_quantization(enabled: bool = False) -> ContextManager:
-    if not enabled:
-        return nullcontext()
+@contextmanager
+def quantization(mode: Optional[str] = None):
+    if mode is None:
+        yield
+        return
 
-    from lightning.fabric.plugins.precision.utils import _ClassReplacementContextManager
+    if mode == "bnb.int8":
+        from quantize.bnb import InferenceLinear8bitLt
 
-    from quantize.gptq import ColBlockQuantizedLinear
+        quantized_linear_cls = InferenceLinear8bitLt
+    elif mode == "bnb.fp4":
+        from quantize.bnb import Linear4bit
 
-    class QuantizedLinear(ColBlockQuantizedLinear):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, bits=4, tile_cols=-1, **kwargs)
+        # Use a class instead `functools.partial` to respect `isinstance` checks and attribute accesses
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="fp4", compress_statistics=False, **kwargs)
 
-    return _ClassReplacementContextManager({"torch.nn.Linear": QuantizedLinear})
+        quantized_linear_cls = QuantizedLinear
+    elif mode == "bnb.fp4-dq":
+        from quantize.bnb import Linear4bit
+
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="fp4", compress_statistics=True, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
+    elif mode == "bnb.nf4":
+        from quantize.bnb import Linear4bit
+
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="nf4", compress_statistics=False, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
+    elif mode == "bnb.nf4-dq":
+        from quantize.bnb import Linear4bit
+
+        class QuantizedLinear(Linear4bit):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, quant_type="nf4", compress_statistics=True, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
+    elif mode == "gptq.int4":
+        from quantize.gptq import ColBlockQuantizedLinear
+
+        class QuantizedLinear(ColBlockQuantizedLinear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, bits=4, tile_cols=-1, **kwargs)
+
+        quantized_linear_cls = QuantizedLinear
+    else:
+        raise ValueError(f"Unknown quantization mode: {mode}")
+
+    torch_linear_cls = torch.nn.Linear
+    torch.nn.Linear = quantized_linear_cls
+    yield
+    torch.nn.Linear = torch_linear_cls
+
+
+# this is taken from torchhacks https://github.com/lernapparat/torchhacks
+
+
+class NotYetLoadedTensor:
+    def __init__(self, metatensor, archiveinfo, storageinfo, rebuild_args):
+        self.metatensor = metatensor
+        self.archiveinfo = archiveinfo
+        self.storageinfo = storageinfo
+        self.rebuild_args = rebuild_args
+
+    @classmethod
+    def rebuild_from_type_v2(cls, func, new_type, args, state, *, archiveinfo=None):
+        ret = func(*args)
+        if isinstance(ret, NotYetLoadedTensor):
+            old_lt = ret._load_tensor
+
+            def _load_tensor():
+                t = old_lt()
+                return torch._tensor._rebuild_from_type_v2(lambda: t, new_type, (), state)
+
+            ret._load_tensor = _load_tensor
+            return ret
+        return torch._tensor._rebuild_from_type_v2(func, new_type, args, state)
+
+    @classmethod
+    def rebuild_parameter(cls, data, requires_grad, backward_hooks, *, archiveinfo=None):
+        if isinstance(data, NotYetLoadedTensor):
+            old_lt = data._load_tensor
+
+            def _load_tensor():
+                t = old_lt()
+                return torch._utils._rebuild_parameter(t, requires_grad, backward_hooks)
+
+            data._load_tensor = _load_tensor
+            return data
+        return torch._utils._rebuild_parameter(data, requires_grad, backward_hooks)
+
+    @classmethod
+    def rebuild_tensor_v2(
+        cls, storage, storage_offset, size, stride, requires_grad, backward_hooks, metadata=None, *, archiveinfo=None
+    ):
+        rebuild_args = (storage_offset, size, stride, requires_grad, backward_hooks, metadata)
+        metatensor = torch._utils._rebuild_tensor_v2(
+            storage, storage_offset, size, stride, requires_grad, backward_hooks, metadata
+        )
+        storageinfo = storage.archiveinfo
+        return NotYetLoadedTensor(metatensor, archiveinfo, storageinfo, rebuild_args)
+
+    def _load_tensor(self):
+        name, storage_cls, fn, device, size = self.storageinfo
+        dtype = self.metatensor.dtype
+
+        uts = (
+            self.archiveinfo.zipfile_context.zf.get_storage_from_record(
+                f"data/{fn}", size * torch._utils._element_size(dtype), torch.UntypedStorage
+            )
+            ._typed_storage()
+            ._untyped_storage
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            storage = torch.storage.TypedStorage(wrap_storage=uts, dtype=self.metatensor.dtype, _internal=True)
+        return torch._utils._rebuild_tensor_v2(storage, *self.rebuild_args)
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        loaded_args = [(a._load_tensor() if isinstance(a, NotYetLoadedTensor) else a) for a in args]
+        return func(*loaded_args, **kwargs)
+        # gc.collect would be costly here, maybe do it optionally
+
+    def __getattr__(self, name):
+        # properties
+        ## TODO: device, is_...??
+        ## TODO: mH, mT, H, T, data, imag, real
+        ## name ???
+        if name in {
+            "dtype",
+            "grad",
+            "grad_fn",
+            "layout",
+            "names",
+            "ndim",
+            "output_nr",
+            "requires_grad",
+            "retains_grad",
+            "shape",
+            "volatile",
+        }:
+            return getattr(self.metatensor, name)
+        if name in {"size"}:
+            return getattr(self.metatensor, name)
+        # materializing with contiguous is needed for quantization
+        if name in {"contiguous"}:
+            return getattr(self._load_tensor(), name)
+
+        raise AttributeError(f"{type(self)} does not have {name}")
+
+    def __repr__(self):
+        return f"NotYetLoadedTensor({repr(self.metatensor)})"
+
+
+class LazyLoadingUnpickler(pickle.Unpickler):
+    def __init__(self, file, zipfile_context):
+        super().__init__(file)
+        self.zipfile_context = zipfile_context
+
+    def find_class(self, module, name):
+        res = super().find_class(module, name)
+        if module == "torch._utils" and name == "_rebuild_tensor_v2":
+            return partial(NotYetLoadedTensor.rebuild_tensor_v2, archiveinfo=self)
+        if module == "torch._tensor" and name == "_rebuild_from_type_v2":
+            return partial(NotYetLoadedTensor.rebuild_from_type_v2, archiveinfo=self)
+        if module == "torch._utils" and name == "_rebuild_parameter":
+            return partial(NotYetLoadedTensor.rebuild_parameter, archiveinfo=self)
+        return res
+
+    def persistent_load(self, pid):
+        name, cls, fn, device, size = pid
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            s = torch.storage.TypedStorage(dtype=cls().dtype, device="meta")
+        s.archiveinfo = pid
+        return s
+
+
+class lazy_load:
+    def __init__(self, fn):
+        self.zf = torch._C.PyTorchFileReader(str(fn))
+        with BytesIO(self.zf.get_record("data.pkl")) as pkl:
+            mup = LazyLoadingUnpickler(pkl, self)
+            self.sd = mup.load()
+
+    def __enter__(self):
+        return self.sd
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        del self.zf  # I don't think there is a way to force closing...
+        self.zf = None
 
 
 def check_valid_checkpoint_dir(checkpoint_dir: Path) -> None:
@@ -118,18 +295,10 @@ class SavingProxyForStorage:
 class SavingProxyForTensor:
     def __init__(self, tensor, saver, protocol_version=5):
         self.protocol_version = protocol_version
-        self.reduce_ret_fn, reduce_args = tensor.__reduce_ex__(protocol_version)
-        if reduce_args[0] == torch._utils._rebuild_tensor_v2:
-            # for Tensors with Python attributes
-            (a0, a1, (storage, *a2_other), *other_reduce_args) = reduce_args
-            assert isinstance(storage, torch.storage.TypedStorage), "Please check for updates"
-            storage_proxy = SavingProxyForStorage(storage, saver, protocol_version=protocol_version)
-            self.reduce_args = (a0, a1, (storage_proxy, *a2_other), *other_reduce_args)
-        else:
-            (storage, *other_reduce_args) = reduce_args
-            assert isinstance(storage, torch.storage.TypedStorage), "Please check for updates"
-            storage_proxy = SavingProxyForStorage(storage, saver, protocol_version=protocol_version)
-            self.reduce_args = (storage_proxy, *other_reduce_args)
+        self.reduce_ret_fn, (storage, *other_reduce_args) = tensor.__reduce_ex__(protocol_version)
+        assert isinstance(storage, torch.storage.TypedStorage), "Please check for updates"
+        storage_proxy = SavingProxyForStorage(storage, saver, protocol_version=protocol_version)
+        self.reduce_args = (storage_proxy, *other_reduce_args)
 
     def __reduce_ex__(self, protocol_version):
         if protocol_version != self.protocol_version:
@@ -238,6 +407,36 @@ class incremental_save:
 T = TypeVar("T")
 
 
+def step_csv_logger(*args: Any, cls: Type[T] = CSVLogger, **kwargs: Any) -> T:
+    logger = cls(*args, **kwargs)
+
+    def merge_by(dicts, key):
+        from collections import defaultdict
+
+        out = defaultdict(dict)
+        for d in dicts:
+            if key in d:
+                out[d[key]].update(d)
+        return [v for _, v in sorted(out.items())]
+
+    def save(self) -> None:
+        """Overridden to merge CSV by the step number."""
+        import csv
+
+        if not self.metrics:
+            return
+        metrics = merge_by(self.metrics, "step")
+        keys = sorted({k for m in metrics for k in m})
+        with self._fs.open(self.metrics_file_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(metrics)
+
+    logger.experiment.save = MethodType(save, logger.experiment)
+
+    return logger
+
+
 def chunked_cross_entropy(
     logits: Union[torch.Tensor, List[torch.Tensor]], targets: torch.Tensor, chunk_size: int = 128
 ) -> torch.Tensor:
@@ -262,9 +461,7 @@ def chunked_cross_entropy(
             torch.nn.functional.cross_entropy(logit_chunk, target_chunk, ignore_index=-1, reduction="none")
             for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
         ]
-        non_masked_elems = (targets != -1).sum()
-        mean_loss = torch.cat(loss_chunks).sum() / max(1, non_masked_elems)
-        return mean_loss
+        return torch.cat(loss_chunks).mean()
 
     # no chunking at all
     logits = logits.reshape(-1, logits.size(-1))
@@ -279,9 +476,7 @@ def chunked_cross_entropy(
         torch.nn.functional.cross_entropy(logit_chunk, target_chunk, ignore_index=-1, reduction="none")
         for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
     ]
-    non_masked_elems = (targets != -1).sum()
-    mean_loss = torch.cat(loss_chunks).sum() / max(1, non_masked_elems)
-    return mean_loss
+    return torch.cat(loss_chunks).mean()
 
 
 def map_old_state_dict_weights(state_dict: Dict, mapping: Mapping, prefix: str) -> Dict:
@@ -293,59 +488,19 @@ def map_old_state_dict_weights(state_dict: Dict, mapping: Mapping, prefix: str) 
     return state_dict
 
 
-def get_default_supported_precision(training: bool) -> str:
-    """Return default precision that is supported by the hardware: either `bf16` or `16`.
+def get_default_supported_precision(training: bool, tpu: bool = False) -> str:
+    """Return default precision that is supported by the hardware.
 
     Args:
         training: `-mixed` or `-true` version of the precision to use
+        tpu: whether TPU device is used
 
     Returns:
         default precision that is suitable for the task and is supported by the hardware
     """
-    from lightning.fabric.accelerators import MPSAccelerator
-
-    if MPSAccelerator.is_available() or (torch.cuda.is_available() and not torch.cuda.is_bf16_supported()):
-        return "16-mixed" if training else "16-true"
-    return "bf16-mixed" if training else "bf16-true"
-
-
-def load_checkpoint(fabric: L.Fabric, model: nn.Module, checkpoint_path: Path, strict: bool = True) -> None:
-    if isinstance(fabric.strategy, FSDPStrategy):
-        fabric.load_raw(checkpoint_path, model, strict=strict)
-    else:
-        state_dict = lazy_load(checkpoint_path)
-        state_dict = state_dict.get("model", state_dict)
-        model.load_state_dict(state_dict, strict=strict)
-
-
-def flops_per_param(max_seq_length: int, n_layer: int, n_embd: int, n_params: int) -> int:
-    flops_per_token = 2 * n_params  # each parameter is used for a MAC (2 FLOPS) per network operation
-    # this assumes that all samples have a fixed length equal to the block size
-    # which is most likely false during finetuning
-    flops_per_seq = flops_per_token * max_seq_length
-    attn_flops_per_seq = n_layer * 2 * 2 * (n_embd * (max_seq_length**2))
-    return flops_per_seq + attn_flops_per_seq
-
-
-def estimate_flops(model: "GPT", training: bool) -> int:
-    """Measures estimated FLOPs for MFU.
-
-    Refs:
-        * https://ar5iv.labs.arxiv.org/html/2205.05198#A1
-        * https://ar5iv.labs.arxiv.org/html/2204.02311#A2
-    """
-    # using all parameters for this is a naive over estimation because not all model parameters actually contribute to
-    # this FLOP computation (e.g. embedding, norm). For this reason, the result will be higher by a fixed percentage
-    # (~10%) compared to the measured FLOPs, making those lower but more realistic.
-    # For a proper estimate, this needs a more fine-grained calculation as in Appendix A of the paper.
-    n_trainable_params = num_parameters(model, requires_grad=True)
-    trainable_flops = flops_per_param(
-        model.max_seq_length, model.config.n_layer, model.config.n_embd, n_trainable_params
-    )
-    # forward + backward + gradients (assumes no gradient accumulation)
-    ops_per_step = 3 if training else 1
-    n_frozen_params = num_parameters(model, requires_grad=False)
-    frozen_flops = flops_per_param(model.max_seq_length, model.config.n_layer, model.config.n_embd, n_frozen_params)
-    # forward + backward
-    frozen_ops_per_step = 2 if training else 1
-    return ops_per_step * trainable_flops + frozen_ops_per_step * frozen_flops
+    if tpu:
+        return "32-true"
+    if not torch.cuda.is_available() or torch.cuda.is_bf16_supported():
+        return "bf16-true"
+        # return "bf16-mixed" if training else "bf16-true"
+    return "16-mixed" if training else "16-true"

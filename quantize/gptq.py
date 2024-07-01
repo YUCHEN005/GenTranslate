@@ -2,6 +2,7 @@
 # E. Frantar et al GPTQ: Accurate Post-training Compression for GPT, arXiv:2210.17323
 # portions copyright by the authors licensed under the Apache License 2.0
 import gc
+import json
 import math
 import sys
 import time
@@ -225,9 +226,6 @@ def qlinear_4bit_weight(inp, weight, scales, zeros):
 # for correctness but with terrible perf
 class ColBlockQuantizedLinear(torch.nn.Module):
     def __init__(self, in_features, out_features, bias: bool, *, bits, tile_cols):
-        if not _TRITON_AVAILABLE:
-            raise ModuleNotFoundError(str(_TRITON_AVAILABLE))
-
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -277,7 +275,8 @@ class ColBlockQuantizedLinear(torch.nn.Module):
 
     def forward(self, inp):
         if (
-            self.bits == 4
+            triton is not None
+            and self.bits == 4
             and self.quant_weight.device.type == "cuda"
             and self.zeros.shape[1] == 1
             and self.quant_weight.shape[1] % 32 == 0
@@ -305,9 +304,6 @@ class GPTQQuantizer:
         groupsize=-1,
         actorder=False,
     ):
-        if not _TRITON_AVAILABLE:
-            raise ModuleNotFoundError(str(_TRITON_AVAILABLE))
-
         assert isinstance(linear_module, torch.nn.Linear)
 
         self.linear_module = linear_module
@@ -488,9 +484,6 @@ def blockwise_quantization(model, sample_inputs, working_device, *, bits=4, grou
     We quantize in order, i.e. when observing the inputs, we use the outputs of the previously quantized layers rather
     than doing them all at once.
     """
-    if not _TRITON_AVAILABLE:
-        raise ModuleNotFoundError(str(_TRITON_AVAILABLE))
-
     print(model)
     print(model.config)
 
@@ -500,6 +493,9 @@ def blockwise_quantization(model, sample_inputs, working_device, *, bits=4, grou
     inps = model.transformer.wte(sample_inputs)
     model.transformer.wte.to("cpu")
     torch.cuda.empty_cache()
+
+    rope_cache = model.build_rope_cache(sample_inputs)
+    mask_cache = model.build_mask_cache(sample_inputs)
 
     print("Starting to quantize blocks")
     outs = torch.zeros_like(inps)
@@ -526,7 +522,9 @@ def blockwise_quantization(model, sample_inputs, working_device, *, bits=4, grou
             gptq = GPTQQuantizer(module, bits=bits, groupsize=groupsize, actorder=(groupsize == -1))
             handle = module.register_forward_hook(gptq.collect_input_stats)
             for j in range(inps.size(0)):
-                outs[j : j + 1] = block(inps[j : j + 1], cos=model.cos, sin=model.sin)
+                outs[j : j + 1], _ = block(
+                    inps[j : j + 1], rope=rope_cache, mask=mask_cache, max_seq_length=model.config.block_size
+                )
 
             handle.remove()
 
@@ -546,7 +544,9 @@ def blockwise_quantization(model, sample_inputs, working_device, *, bits=4, grou
             print(f"time {int(t1 - t0 + 0.5)}s quantization error {error:.1f}")
 
         for j in range(inps.size(0)):
-            outs[j : j + 1] = block(inps[j : j + 1], cos=model.cos, sin=model.sin)
+            outs[j : j + 1], _ = block(
+                inps[j : j + 1], rope=rope_cache, mask=mask_cache, max_seq_length=model.config.block_size
+            )
 
         block.cpu()
         gc.collect()
@@ -587,29 +587,27 @@ def main(
         n_samples: Number of example inputs to use for statistics (default: 128)
         precision: The precision to use to load the model.
     """
-    if not _TRITON_AVAILABLE:
-        raise ModuleNotFoundError(str(_TRITON_AVAILABLE))
-
     precision = precision or get_default_supported_precision(training=False)
 
     if output_path is None:
         output_path = checkpoint_dir / "lit_model_gptq.4bit.pth"
     check_valid_checkpoint_dir(checkpoint_dir)
 
-    config = Config.from_json(checkpoint_dir / "lit_config.json")
+    with open(checkpoint_dir / "lit_config.json") as fp:
+        config = Config(**json.load(fp))
 
     device = "cuda"
-    fabric = Fabric(accelerator="cuda", devices=1, precision=precision)
+    fabric = Fabric(accelerator="cuda", precision=precision)
 
     # we avoid loading the entire model on the GPU and do this block by block
     checkpoint_path = checkpoint_dir / "lit_model.pth"
-    print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
+    print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=True):
         model = GPT(config)
-    checkpoint = lazy_load(checkpoint_path)
-    model.load_state_dict(checkpoint)
-    print(f"Time to load model: {time.perf_counter() - t0:.02f} seconds.")
+    with lazy_load(checkpoint_path) as checkpoint:
+        model.load_state_dict(checkpoint)
+    print(f"Time to load model: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
     model.eval()
 
@@ -624,8 +622,8 @@ def main(
     blockwise_quantization(model, encoded_text, device, bits=4)
     t = time.perf_counter() - t0
 
-    print(f"\n\nTime for quantization: {t:.02f} sec total")
-    print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
+    print(f"\n\nTime for quantization: {t:.02f} sec total", file=sys.stderr)
+    print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB", file=sys.stderr)
 
     torch.save(model.state_dict(), output_path)
 
