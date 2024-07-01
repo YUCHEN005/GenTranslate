@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 ## Models and Checkpoints
 
-- For LLMs, please refer to [tutorial](https://github.com/YUCHEN005/GenTranslate/tree/master/tutorials) for download and conversion, which support many mainstream LLMs like [LLaMA-2](https://github.com/YUCHEN005/GenTranslate/tree/master/tutorials/download_model_weights.md) (we use `Llama-2-7b-hf` and `Llama-2-13b-hf` in this work);
+- For LLMs, please refer to [tutorial](https://github.com/YUCHEN005/GenTranslate/tree/master/tutorials) for download and conversion, which support many mainstream LLMs like [LLaMA-2](https://github.com/YUCHEN005/GenTranslate/blob/master/tutorials/download_llama_2.md) (we use `Llama-2-7b-hf` and `Llama-2-13b-hf` in this work);
 - For well-trained adapter checkpoints, please refer to our [HuggingFace repo](https://huggingface.co/PeacefulData/GenTranslate).
 
 ## Dataset
