@@ -1,6 +1,6 @@
 # GenTranslate: Large Language Models are Generative Multilingual Speech and Machine Translators
 
-[[Paper]](https://arxiv.org/abs/2402.06894) [[Data]](https://huggingface.co/datasets/PeacefulData/HypoTranslate) [[Model]](https://huggingface.co/PeacefulData/GenTranslate) [![Language](https://img.shields.io/badge/Language-multilingual-lightgrey#model-badge)](#datasets)
+[[Paper]](https://arxiv.org/abs/2402.06894) [[Data]](https://huggingface.co/datasets/PeacefulData/HypoTranslate) [[Model]](https://huggingface.co/PeacefulData/GenTranslate) [![Language](https://img.shields.io/badge/Language-multilingual-lightgrey#model-badge)](#datasets) | ACL 2024, Oral
 
 <p align="center">  <img src="https://github.com/YUCHEN005/GenTranslate/blob/master/tutorials/gentranslate.png" height ="300"> </p>
 
